@@ -183,7 +183,6 @@ def build_analysis_payload(df: pd.DataFrame) -> dict[str, Any]:
             "summary": _dataframe_records(dcf_summary),
             "assumptions": dcf_assumptions,
             "latest": dcf_latest,
-            "history": _dataframe_records(historical_dcf_data),
         },
     }
 
@@ -352,4 +351,3 @@ def _json_safe(value: Any) -> Any:
     except (TypeError, ValueError):
         pass
     return value
-
