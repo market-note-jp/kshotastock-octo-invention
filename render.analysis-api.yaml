@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: kanalyzer-analysis-api
+    env: docker
+    dockerfilePath: ./Dockerfile.analysis-api
+    healthCheckPath: /health
+    envVars:
+      - key: EDINET_API_KEY
+        sync: false
+      - key: KANALYZER_ALLOWED_ORIGINS
+        value: https://kanalyzer-edinet-finance.ktsht.chatgpt.site
+
