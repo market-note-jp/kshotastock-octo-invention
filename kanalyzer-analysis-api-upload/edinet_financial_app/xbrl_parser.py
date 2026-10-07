@@ -54,11 +54,20 @@ class Fact:
 
 
 METRIC_SPECS: dict[str, MetricSpec] = {
+    "financial_services_receivables_current": MetricSpec(
+        "金融事業債権（流動）", "instant", ("ReceivablesRelatedToFinancialServicesCAIFRS",),
+    ),
+    "financial_services_receivables_noncurrent": MetricSpec(
+        "金融事業債権（非流動）", "instant", ("ReceivablesRelatedToFinancialServicesNCAIFRS",),
+    ),
     "revenue": MetricSpec(
         "売上高",
         "duration",
         (
             "RevenueIFRSSummaryOfBusinessResults",
+            "OperatingRevenuesIFRSKeyFinancialData",
+            "SalesRevenuesIFRS",
+            "OperatingRevenueFromExternalCustomersIFRS",
             "RevenueFromExternalCustomers2IFRS",
             "RevenueFromExternalCustomersIFRS",
             "Revenue2IFRS",
@@ -276,6 +285,7 @@ METRIC_SPECS: dict[str, MetricSpec] = {
         "instant",
         (
             "TradeReceivablesCAIFRS",
+            "TradeAndOtherReceivablesCAIFRS",
             "NotesAndAccountsReceivableTrade",
             "AccountsReceivableTrade",
             "TradeReceivables",
@@ -288,6 +298,7 @@ METRIC_SPECS: dict[str, MetricSpec] = {
         "instant",
         (
             "TradePayablesCLIFRS",
+            "TradeAndOtherPayablesCLIFRS",
             "NotesAndAccountsPayableTrade",
             "AccountsPayableTrade",
             "TradePayables",
@@ -706,6 +717,7 @@ def _extract_metric(
             exclude_nonconsolidated=prefer_consolidated and not spec.allow_nonconsolidated,
             allow_share_unit=spec.allow_share_unit,
         )
+
         if value is None:
             continue
         total += value
@@ -887,6 +899,19 @@ def _extract_interest_bearing_debt(
             raw_value=direct_value,
         )
 
+    # These issuer totals already include interest-bearing obligations.
+    # Do not add borrowing/lease detail a second time.
+    liability_parts = []
+    for name in ("InterestBearingLiabilitiesCLIFRS", "InterestBearingLiabilitiesNCLIFRS"):
+        value, detail = _best_debt_current_value(facts, contexts, (name,), prefer_consolidated=prefer_consolidated)
+        if value is not None:
+            liability_parts.append(_debt_component_detail(name, value, detail))
+    if liability_parts:
+        if len(liability_parts) != 2:
+            return None, {"value": None, "method": "incomplete_current_noncurrent_total", "note": "Current or non-current interest-bearing liability total is missing."}
+        total = sum(part["value"] for part in liability_parts)
+        return total, _debt_detail(total, "current_noncurrent_interest_bearing_totals", component_details=liability_parts)
+
     combined_components = []
     combined_total = 0.0
     for label, names in (
@@ -934,11 +959,11 @@ def _extract_interest_bearing_debt(
         return total, _debt_detail(total, "sum_components", component_details=component_details)
 
     if not _has_current_debt_balance_sheet_fact(facts, contexts, prefer_consolidated=prefer_consolidated):
-        return 0.0, {
-            "value": 0.0,
-            "method": "assumed_zero_no_debt_tags",
+        return None, {
+            "value": None,
+            "method": "unavailable_no_debt_tags",
             "source_tags": [],
-            "note": "No current interest-bearing debt balance sheet tags were found; treated as zero.",
+            "note": "No recognized current interest-bearing debt tags were found; the balance is unknown, not zero.",
         }
 
     return None, None
@@ -1058,7 +1083,7 @@ def _extract_treasury_shares(
     value, detail = _best_value_for_names(
         facts,
         contexts,
-        names=("numberofsharesissuedsharesvotingrights",),
+        names=("totalnumberofsharesheldtreasurysharesetc",),
         period_type=spec.period_type,
         exclude_nonconsolidated=prefer_consolidated and not spec.allow_nonconsolidated,
         allow_share_unit=True,
@@ -1069,7 +1094,17 @@ def _extract_treasury_shares(
         detail["method"] = "context_filtered_treasury_shares"
         return value, detail
 
-    return _extract_metric("treasury_shares", spec, facts, contexts, prefer_consolidated=prefer_consolidated)
+    # The voting-rights table's totals, including its TreasurySharesEtcMember,
+    # can also include reciprocal holdings and omit less-than-one-unit shares.
+    # They are not a reliable exact issuer treasury-stock count.
+    safe_spec = MetricSpec(spec.label, spec.period_type, (
+        "NumberOfTreasuryShares", "TotalNumberOfTreasuryShares",
+        "NumberOfSharesOfTreasuryShares",
+    ), allow_share_unit=True, allow_nonconsolidated=True)
+    value, detail = _extract_metric("treasury_shares", safe_spec, facts, contexts, prefer_consolidated=prefer_consolidated)
+    if value is None:
+        return None, {"value": None, "method": "unavailable_ambiguous_voting_rights_total", "note": "Treasury shares could not be distinguished from reciprocal holdings; manual confirmation is required."}
+    return value, detail
 
 
 def _extract_capex(

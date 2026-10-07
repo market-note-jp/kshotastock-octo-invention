@@ -11,10 +11,17 @@ import pandas as pd
 from anomaly_detection import detect_anomalies
 from app_config import get_user_data_dir, load_edinet_api_key
 from database import get_saved_fiscal_month, save_financial_record
-from dcf_analysis import assumptions_from_summary, calculate_historical_dcf_metrics
+from dcf_analysis import assumptions_from_summary, build_dcf_model, calculate_historical_dcf_metrics
 from edinet_api import EdinetApiError, EdinetClient, normalize_edinet_code
 from excel_export import format_security_code
-from financial_analysis import calculate_indicators, format_amount, format_percent
+from financial_analysis import (
+    INDICATOR_LABELS,
+    RAW_METRIC_ORDER,
+    calculate_indicators,
+    calculate_price_indicators,
+    format_amount,
+    format_percent,
+)
 from report_generator import generate_analysis_comments
 from xbrl_parser import extract_financial_data
 
@@ -166,8 +173,14 @@ def build_analysis_payload(df: pd.DataFrame) -> dict[str, Any]:
     anomalies = detect_anomalies(data)
     historical_dcf_data, dcf_summary, dcf_latest = calculate_historical_dcf_metrics(data)
     dcf_assumptions = assumptions_from_summary(dcf_summary)
+    suitability = _assess_dcf_suitability(latest)
+    dcf_model = (
+        {"error": suitability["message"], "suitability": suitability}
+        if suitability["status"] == "requires_business_separation"
+        else _default_dcf_model(dcf_assumptions, dcf_latest)
+    )
 
-    return {
+    payload = {
         "records": [_record_payload(record) for record in data.to_dict(orient="records")],
         "latest": {
             "companyName": latest.get("company_name"),
@@ -177,13 +190,35 @@ def build_analysis_payload(df: pd.DataFrame) -> dict[str, Any]:
             "fiscalYear": latest.get("fiscal_year"),
         },
         "metrics": _metric_cards(latest),
+        "priceIndicators": _json_safe(calculate_price_indicators(data)),
         "anomalies": anomalies,
         "comments": generate_analysis_comments(data, anomalies),
         "dcf": {
+            "suitability": suitability,
             "summary": _dataframe_records(dcf_summary),
             "assumptions": dcf_assumptions,
+            "historical": _dataframe_records(_dcf_history_payload(historical_dcf_data)),
             "latest": dcf_latest,
+            "model": dcf_model,
         },
+    }
+    return _json_safe(payload)
+
+
+def _assess_dcf_suitability(latest: pd.Series) -> dict[str, Any]:
+    financial_receivables = {
+        key: _safe_number(latest.get(key))
+        for key in ("financial_services_receivables_current", "financial_services_receivables_noncurrent")
+    }
+    if any(value is not None and value > 0 for value in financial_receivables.values()):
+        return {
+            "status": "requires_business_separation",
+            "message": "金融事業の債権が含まれています。通常の事業会社向けDCFを全社に適用すると、事業キャッシュフローと負債の範囲が一致しない可能性があります。金融事業と非金融事業を分けて評価するまで、理論株価の表示を保留します。",
+            "evidence": financial_receivables,
+        }
+    return {
+        "status": "not_independently_reviewed",
+        "message": "DCFは過去実績の平均と仮定WACC 8%・永続成長率1%による参考試算です。企業固有の資本コスト・成長見通しや適用範囲は未審査です。金融事業が検出されなかったことは、その不存在の証明ではありません。",
     }
 
 
@@ -208,17 +243,120 @@ def _record_payload(record: dict[str, Any]) -> dict[str, Any]:
         "fiscal_year",
         "period_end",
         "submit_date_time",
-        "revenue",
-        "operating_income",
-        "net_income",
-        "operating_cf",
-        "fcf",
-        "roe",
-        "roa",
-        "roic",
-        "equity_ratio",
+        "unit",
+        *RAW_METRIC_ORDER,
+        *INDICATOR_LABELS.keys(),
+        "roic_tax_rate",
+        "roic_tax_source",
+        "roic_uses_estimated_tax",
+        "roic_profit_base",
+        "nopat",
+        "invested_capital",
+        "previous_invested_capital",
+        "average_invested_capital",
+        "roic_invested_capital_formula",
+        "roic_uses_alternative_invested_capital",
+        "roic_invested_capital_note",
+        "roic_unavailable_reason",
+        "issued_shares",
+        "treasury_shares",
+        "shares_for_valuation",
+        "financial_services_receivables_current",
+        "financial_services_receivables_noncurrent",
     ]
-    return {key: record.get(key) for key in keys}
+    return {key: record.get(key) for key in dict.fromkeys(keys)}
+
+
+def _dcf_history_payload(df: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "fiscal_year",
+        "period_end",
+        "sales_growth_rate",
+        "operating_margin",
+        "effective_tax_rate",
+        "dcf_nopat",
+        "dcf_invested_capital",
+        "dcf_previous_invested_capital",
+        "dcf_average_invested_capital",
+        "depreciation_rate",
+        "capex_outflow",
+        "capex_rate",
+        "capex_method",
+        "working_capital",
+        "working_capital_ratio",
+        "change_in_working_capital",
+        "dcf_fcf",
+        "fcf_margin",
+        "roic",
+    ]
+    existing = [column for column in columns if column in df.columns]
+    return df[existing].copy() if existing else pd.DataFrame()
+
+
+def _default_dcf_model(assumptions: dict[str, Any], latest_info: dict[str, Any]) -> dict[str, Any] | None:
+    required_inputs = {
+        "latest_revenue": "直近年度の売上高", "latest_cash": "現金及び現金同等物",
+        "latest_debt": "有利子負債", "latest_working_capital": "運転資本",
+        "shares_for_valuation": "評価用株式数",
+    }
+    assumption_labels = {
+        "sales_growth_rate": "売上成長率（複数年度が必要）", "operating_margin": "営業利益率",
+        "effective_tax_rate": "実効税率", "capex_rate": "CAPEX率",
+        "depreciation_rate": "減価償却率", "working_capital_ratio": "運転資本率",
+    }
+    missing = [label for key, label in required_inputs.items() if _safe_number(latest_info.get(key)) is None]
+    missing.extend(label for key, label in assumption_labels.items() if _safe_number(assumptions.get(key)) is None)
+    if missing:
+        return {"error": "DCFの必須データを取得できませんでした：" + "、".join(missing) + "。欠損を0で補わず、計算を保留しています。", "missing_inputs": missing}
+    if _safe_number(latest_info.get("shares_for_valuation")) <= 0:
+        return {"error": "評価用株式数は0より大きい必要があります。"}
+    try:
+        result = build_dcf_model(
+            latest_revenue=_safe_number(latest_info.get("latest_revenue")),
+            latest_cash=_safe_number(latest_info.get("latest_cash")),
+            latest_debt=_safe_number(latest_info.get("latest_debt")),
+            latest_working_capital=_safe_number(latest_info.get("latest_working_capital")),
+            forecast_years=5,
+            sales_growth_rate=_safe_assumption(assumptions.get("sales_growth_rate"), 0.0),
+            operating_margin=_safe_assumption(assumptions.get("operating_margin"), 0.0),
+            effective_tax_rate=_safe_assumption(assumptions.get("effective_tax_rate"), 0.30),
+            capex_rate=_safe_assumption(assumptions.get("capex_rate"), 0.0),
+            depreciation_rate=_safe_assumption(assumptions.get("depreciation_rate"), 0.0),
+            working_capital_ratio=_safe_assumption(assumptions.get("working_capital_ratio"), 0.0),
+            wacc=0.08,
+            perpetual_growth_rate=0.01,
+            shares_outstanding=_safe_number(latest_info.get("shares_for_valuation")) or 0.0,
+            current_share_price=0.0,
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    return {
+        "assumptions": {
+            "forecast_years": 5,
+            "wacc": 0.08,
+            "perpetual_growth_rate": 0.01,
+            "sales_growth_rate": _safe_assumption(assumptions.get("sales_growth_rate"), 0.0),
+            "operating_margin": _safe_assumption(assumptions.get("operating_margin"), 0.0),
+            "effective_tax_rate": _safe_assumption(assumptions.get("effective_tax_rate"), 0.30),
+            "capex_rate": _safe_assumption(assumptions.get("capex_rate"), 0.0),
+            "depreciation_rate": _safe_assumption(assumptions.get("depreciation_rate"), 0.0),
+            "working_capital_ratio": _safe_assumption(assumptions.get("working_capital_ratio"), 0.0),
+        },
+        "valuation": {
+            "enterprise_value": result.enterprise_value,
+            "terminal_value": result.terminal_value,
+            "terminal_value_pv": result.terminal_value_pv,
+            "forecast_fcf_pv_sum": result.forecast_fcf_pv_sum,
+            "equity_value": result.equity_value,
+            "theoretical_share_price": result.theoretical_share_price,
+            "price_difference": result.price_difference,
+            "upside_rate": result.upside_rate,
+            "sensitivity_value_label": result.sensitivity_value_label,
+        },
+        "forecast": _dataframe_records(result.forecast),
+        "sensitivity": _dataframe_records(result.sensitivity),
+    }
 
 
 def _company_payload(documents: list[dict[str, Any]], edinet_code: str | None, company_name: str | None) -> dict[str, Any]:
@@ -324,7 +462,25 @@ def _derive_fiscal_year(period_start: str | None, period_end: str | None) -> str
 
 
 def _dataframe_records(df: pd.DataFrame) -> list[dict[str, Any]]:
-    return df.to_dict(orient="records") if isinstance(df, pd.DataFrame) and not df.empty else []
+    records = df.to_dict(orient="records") if isinstance(df, pd.DataFrame) and not df.empty else []
+    return _json_safe(records)
+
+
+def _safe_assumption(value: Any, fallback: float) -> float:
+    parsed = _safe_number(value)
+    return fallback if parsed is None else parsed
+
+
+def _safe_number(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+        parsed = float(value)
+        return parsed if math.isfinite(parsed) else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _json_safe(value: Any) -> Any:

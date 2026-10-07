@@ -49,6 +49,7 @@ def _allowed_origins() -> list[str]:
         return [origin.strip() for origin in raw.split(",") if origin.strip()]
     return [
         "https://kanalyzer-edinet-finance.ktsht.chatgpt.site",
+        "https://market-note-jp.github.io",
         "http://localhost:3000",
         "http://127.0.0.1:3000",
         "http://localhost:8787",
@@ -57,4 +58,3 @@ def _allowed_origins() -> list[str]:
 
 
 app = create_app()
-

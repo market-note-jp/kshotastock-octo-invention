@@ -113,7 +113,7 @@ def calculate_price_indicators(
 
     warnings: list[str] = []
     if shares_outstanding is None or shares_outstanding <= 0:
-        warnings.append("発行済株式数をXBRLから取得できないため、手入力してください。")
+        warnings.append("自己株式を除く評価用株式数をXBRLから確定できないため、原資料で確認した株式数を手入力してください。")
     if current_price is None or current_price <= 0:
         warnings.append("現在株価が未入力のため、PER/PBRは未計算です。")
     if net_income is None:

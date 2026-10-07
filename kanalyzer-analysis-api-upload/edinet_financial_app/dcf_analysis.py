@@ -65,12 +65,13 @@ def calculate_historical_dcf_metrics(df: pd.DataFrame) -> tuple[pd.DataFrame, pd
     previous_invested_capital = _previous_period_value(data.assign(_dcf_invested_capital=invested_capital), "_dcf_invested_capital")
     average_invested_capital = (invested_capital + previous_invested_capital) / 2
     average_invested_capital = average_invested_capital.where(previous_invested_capital.notna(), invested_capital)
-    existing_fcf = data.get("fcf", pd.Series(math.nan, index=data.index))
     existing_roic = data.get("roic", pd.Series(math.nan, index=data.index))
-    dcf_fcf = (fcf_nopat + depreciation - capex_outflow - change_in_working_capital).combine_first(existing_fcf)
+    # CFO + investing CF is a different cash-flow definition. Missing FCFF
+    # inputs or an unavailable first-year change in NWC must stay unknown.
+    dcf_fcf = fcf_nopat + depreciation - capex_outflow - change_in_working_capital
     dcf_roic = _safe_div(roic_nopat, average_invested_capital).combine_first(existing_roic / 100)
 
-    data["sales_growth_rate"] = revenue.pct_change()
+    data["sales_growth_rate"] = revenue.pct_change(fill_method=None)
     data["operating_margin"] = _safe_div(operating_income, revenue)
     data["effective_tax_rate"] = tax_rate
     data["capex_outflow"] = capex_outflow
@@ -79,7 +80,7 @@ def calculate_historical_dcf_metrics(df: pd.DataFrame) -> tuple[pd.DataFrame, pd
     data["working_capital"] = working_capital
     data["working_capital_ratio"] = working_capital_ratio
     data["change_in_working_capital"] = change_in_working_capital
-    data["dcf_nopat"] = roic_nopat
+    data["dcf_nopat"] = fcf_nopat
     data["dcf_fcf"] = dcf_fcf
     data["fcf_margin"] = _safe_div(dcf_fcf, revenue)
     data["dcf_invested_capital"] = invested_capital
@@ -145,6 +146,20 @@ def build_dcf_model(
     shares_outstanding: float,
     current_share_price: float,
 ) -> DcfResult:
+    required_values = {
+        "直近売上高": latest_revenue, "現金": latest_cash, "有利子負債": latest_debt,
+        "運転資本": latest_working_capital, "WACC": wacc, "永続成長率": perpetual_growth_rate,
+        "実効税率": effective_tax_rate, "株式数": shares_outstanding,
+    }
+    for label, value in required_values.items():
+        if _to_float(value) is None:
+            raise ValueError(f"{label}に有限の数値が必要です。")
+    if latest_revenue <= 0 or latest_cash < 0 or latest_debt < 0 or shares_outstanding <= 0:
+        raise ValueError("売上高・株式数は正、現金・有利子負債は0以上で入力してください。")
+    if not 0 <= effective_tax_rate <= 1:
+        raise ValueError("実効税率は0から1の範囲で入力してください。")
+    if wacc <= -1 or perpetual_growth_rate <= -1:
+        raise ValueError("WACCと永続成長率は-100%より大きい必要があります。")
     if wacc <= perpetual_growth_rate:
         raise ValueError("WACCは永続成長率より大きい必要があります。")
     if forecast_years < 1:
@@ -402,7 +417,8 @@ def _to_float(value: Any) -> float | None:
     try:
         if pd.isna(value):
             return None
-        return float(value)
+        parsed = float(value)
+        return parsed if math.isfinite(parsed) else None
     except (TypeError, ValueError):
         return None
 
