@@ -11,6 +11,8 @@ from xbrl_parser import METRIC_LABELS
 
 RAW_METRIC_ORDER = [
     "revenue",
+    "gross_profit",
+    "capital_stock",
     "operating_income",
     "ordinary_income",
     "pretax_income",
@@ -33,6 +35,7 @@ RAW_METRIC_ORDER = [
 ]
 
 INDICATOR_LABELS = {
+    "gross_margin": "粗利率",
     "sales_growth_rate": "売上成長率",
     "operating_margin": "営業利益率",
     "ordinary_margin": "経常利益率",
@@ -97,6 +100,11 @@ def calculate_price_indicators(
     if shares_outstanding is None or shares_outstanding <= 0:
         shares_outstanding = _to_float(manual_shares_outstanding)
         share_count_source = "手入力" if shares_outstanding and shares_outstanding > 0 else "取得不可"
+    if manual_shares_outstanding is not None:
+        shares_outstanding = _to_float(manual_shares_outstanding)
+        if shares_outstanding is not None and shares_outstanding <= 0:
+            shares_outstanding = None
+        share_count_source = "手入力" if shares_outstanding is not None else "取得不可"
 
     unit_name = str(latest.get("unit") or "円")
     net_income = _amount_to_yen(_to_float(latest.get("net_income")), unit_name)
@@ -105,24 +113,29 @@ def calculate_price_indicators(
         equity = _amount_to_yen(_to_float(latest.get("net_assets")), unit_name)
     current_price = _to_float(current_share_price)
 
-    eps = _safe_scalar_div(net_income, shares_outstanding)
-    bps = _safe_scalar_div(equity, shares_outstanding)
+    reported_eps = _to_float(latest.get("reported_eps"))
+    reported_bps = _to_float(latest.get("reported_bps"))
+    eps = reported_eps if reported_eps is not None else _safe_scalar_div(net_income, shares_outstanding)
+    bps = reported_bps if reported_bps is not None else _safe_scalar_div(equity, shares_outstanding)
+    if manual_shares_outstanding is not None:
+        eps = _safe_scalar_div(net_income, shares_outstanding)
+        bps = _safe_scalar_div(equity, shares_outstanding)
     has_current_price = current_price is not None and current_price > 0
     per = _safe_scalar_div(current_price, eps) if has_current_price and eps is not None and eps > 0 else None
     pbr = _safe_scalar_div(current_price, bps) if has_current_price and bps is not None and bps > 0 else None
 
     warnings: list[str] = []
     if shares_outstanding is None or shares_outstanding <= 0:
-        warnings.append("自己株式を除く評価用株式数をXBRLから確定できないため、原資料で確認した株式数を手入力してください。")
+        warnings.append("自己株式を除く株式数は未確定です。公表EPS・BPSが取得できた場合は、その値で参考PER/PBRを計算できます。期末株式数による試算には、確認した株式数を入力してください。")
     if current_price is None or current_price <= 0:
         warnings.append("現在株価が未入力のため、PER/PBRは未計算です。")
-    if net_income is None:
+    if net_income is None and reported_eps is None:
         warnings.append("当期純利益が取得できないため、EPS/PERは計算できません。")
-    elif net_income <= 0:
+    elif eps is not None and eps <= 0:
         warnings.append("当期純利益が0以下のため、PERは計算不可です（赤字PER）。")
-    if equity is None:
+    if equity is None and reported_bps is None:
         warnings.append("自己資本が取得できないため、BPS/PBRは計算できません。")
-    elif equity <= 0:
+    elif bps is not None and bps <= 0:
         warnings.append("自己資本が0以下のため、PBRは計算不可です。")
 
     return {
@@ -133,6 +146,8 @@ def calculate_price_indicators(
         "share_count_source": share_count_source,
         "eps": eps,
         "bps": bps,
+        "eps_source": "公表値" if reported_eps is not None and manual_shares_outstanding is None else "期末株式数から試算",
+        "bps_source": "公表値" if reported_bps is not None and manual_shares_outstanding is None else "期末株式数から試算",
         "per": per,
         "pbr": pbr,
         "net_income_yen": net_income,
@@ -162,18 +177,22 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     avg_equity = _average_with_previous(equity)
     avg_assets = _average_with_previous(result["total_assets"])
 
-    result["sales_growth_rate"] = result["revenue"].pct_change() * 100
+    result["sales_growth_rate"] = result["revenue"].pct_change(fill_method=None) * 100
+    result["gross_margin"] = _safe_div(result["gross_profit"], result["revenue"]) * 100
     result["operating_margin"] = _safe_div(result["operating_income"], result["revenue"]) * 100
     result["ordinary_margin"] = _safe_div(result["ordinary_income"], result["revenue"]) * 100
     result["pretax_margin"] = _safe_div(result["pretax_income"], result["revenue"]) * 100
     result["net_margin"] = _safe_div(result["net_income"], result["revenue"]) * 100
     result["roe"] = _safe_div(result["net_income"], avg_equity) * 100
     result["roa"] = _safe_div(result["net_income"], avg_assets) * 100
+    # End-of-period ratios are provided alongside the average-capital measures.
+    result["roa_period_end"] = _safe_div(result["net_income"], result["total_assets"]) * 100
+    result["roe_period_end"] = _safe_div(result["net_income"], equity) * 100
     result["equity_ratio"] = _safe_div(equity, result["total_assets"]) * 100
     result["operating_cf_margin"] = _safe_div(result["operating_cf"], result["revenue"]) * 100
     result["fcf"] = result["operating_cf"] + result["investing_cf"]
-    result["accounts_receivable_growth_rate"] = result["accounts_receivable"].pct_change() * 100
-    result["inventory_growth_rate"] = result["inventories"].pct_change() * 100
+    result["accounts_receivable_growth_rate"] = result["accounts_receivable"].pct_change(fill_method=None) * 100
+    result["inventory_growth_rate"] = result["inventories"].pct_change(fill_method=None) * 100
     result["interest_bearing_debt_ratio"] = _safe_div(result["interest_bearing_debt"], result["total_assets"]) * 100
 
     roic_rows = [_calculate_roic_row(row) for _, row in result.iterrows()]

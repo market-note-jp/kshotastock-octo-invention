@@ -54,6 +54,26 @@ class Fact:
 
 
 METRIC_SPECS: dict[str, MetricSpec] = {
+    "gross_profit": MetricSpec("売上総利益", "duration", (
+        "GrossProfitIFRS", "GrossProfitLossIFRS", "GrossProfit", "GrossProfitLoss",
+    )),
+    "capital_stock": MetricSpec("資本金", "instant", (
+        "CapitalStockSummaryOfBusinessResults", "CapitalStock", "ShareCapitalIFRS", "IssuedCapitalIFRS",
+    ), allow_nonconsolidated=True),
+    "reported_eps": MetricSpec("EPS（公表値）", "duration", (
+        "BasicEarningsLossPerShareIFRSSummaryOfBusinessResults", "BasicEarningsLossPerShareIFRS",
+        "BasicEarningsLossPerShareSummaryOfBusinessResults", "BasicEarningsLossPerShare",
+        "BasicEarningsPerShareIFRS", "BasicEarningsPerShare", "NetIncomePerShareSummaryOfBusinessResults",
+        "NetIncomeLossPerShare", "EarningsPerShare",
+    ), allow_share_unit=True),
+    "reported_bps": MetricSpec("BPS（公表値）", "instant", (
+        # EDINET's IFRS summary uses this historic name for a JPYPerShares fact.
+        # Pure/ratio units remain rejected by the metric selector.
+        "EquityToAssetRatioIFRSSummaryOfBusinessResults",
+        "EquityAttributableToOwnersOfParentPerShareIFRSSummaryOfBusinessResults",
+        "EquityAttributableToOwnersOfParentPerShareIFRS", "NetAssetsPerShareIFRSSummaryOfBusinessResults",
+        "NetAssetsPerShareSummaryOfBusinessResults", "NetAssetsPerShare",
+    ), allow_share_unit=True),
     "financial_services_receivables_current": MetricSpec(
         "金融事業債権（流動）", "instant", ("ReceivablesRelatedToFinancialServicesCAIFRS",),
     ),
@@ -504,6 +524,7 @@ def extract_financial_data(extracted_dir: str | Path) -> dict:
     extracted_dir = Path(extracted_dir)
     facts: list[Fact] = []
     contexts: dict[str, ContextInfo] = {}
+    document_metadata: dict[str, str | None] = {}
 
     for file_path in _candidate_files(extracted_dir):
         try:
@@ -512,13 +533,26 @@ def extract_financial_data(extracted_dir: str | Path) -> dict:
             continue
         facts.extend(file_facts)
         contexts.update(file_contexts)
+        # DEI text facts describe the filing's accounting basis, not a metric.
+        if file_path.suffix.lower() == ".xbrl":
+            document_metadata.update(_extract_document_metadata(file_path))
 
     metrics: dict[str, float | None] = {}
     details: dict[str, dict | None] = {}
     prefer_consolidated = _has_consolidated_facts(facts, contexts)
 
     for key, spec in METRIC_SPECS.items():
-        if key == "revenue":
+        if key in {"capex", "rnd_expenses", "inventories", "accounts_receivable"}:
+            continue
+        if key in {"gross_profit", "capital_stock", "reported_eps", "reported_bps"}:
+            current_facts = [fact for fact in facts if "prior" not in (fact.context_ref or "").lower()
+                             and "previous" not in (fact.context_ref or "").lower()
+                             and not any(term in f"{fact.context_ref} {contexts.get(fact.context_ref, ContextInfo('')).raw_text}".lower()
+                                         for term in ("segment", "reconciling", "geographical"))]
+            value, detail = _extract_metric(key, spec, current_facts, contexts, prefer_consolidated=prefer_consolidated)
+        elif key == "equity":
+            value, detail = _extract_equity(facts, contexts, prefer_consolidated=prefer_consolidated)
+        elif key == "revenue":
             value, detail = _extract_revenue(spec, facts, contexts, prefer_consolidated=prefer_consolidated)
         elif key == "treasury_shares":
             value, detail = _extract_treasury_shares(spec, facts, contexts, prefer_consolidated=prefer_consolidated)
@@ -532,6 +566,21 @@ def extract_financial_data(extracted_dir: str | Path) -> dict:
         details[key] = detail
 
     _add_valuation_share_count(metrics, details)
+    per_share_history: dict[str, dict] = {}
+    for key in ("reported_eps", "reported_bps"):
+        spec = METRIC_SPECS[key]
+        names = {_normalize_name(name) for name in spec.candidates}
+        candidates = [fact for fact in facts if _normalize_name(fact.local_name) in names]
+        periods = {context.end_date if spec.period_type == "duration" else context.instant
+                   for fact in candidates if (context := contexts.get(fact.context_ref or ""))}
+        for period in sorted(value for value in periods if value):
+            period_facts = [fact for fact in candidates if (context := contexts.get(fact.context_ref or ""))
+                            and (context.end_date if spec.period_type == "duration" else context.instant) == period
+                            and not any(term in f"{fact.context_ref} {context.raw_text}".lower() for term in ("segment", "reconciling", "geographical"))]
+            value, detail = _extract_metric(key, spec, period_facts, contexts, prefer_consolidated=prefer_consolidated)
+            if value is not None:
+                per_share_history.setdefault(period, {})[key] = value
+                per_share_history[period][key + "_detail"] = detail
 
     return {
         "metrics": metrics,
@@ -539,8 +588,47 @@ def extract_financial_data(extracted_dir: str | Path) -> dict:
         "facts_count": len(facts),
         "contexts_count": len(contexts),
         "prefer_consolidated": prefer_consolidated,
+        "document_metadata": document_metadata,
+        "per_share_history": per_share_history,
         "source_dir": str(extracted_dir),
     }
+
+
+def _extract_document_metadata(path: Path) -> dict[str, str | None]:
+    tree = etree.parse(str(path), etree.XMLParser(recover=True, resolve_entities=False, no_network=True))
+    metadata: dict[str, str | None] = {}
+    standards = {"Japan GAAP": "日本会計基準", "IFRS": "IFRS", "US GAAP": "米国会計基準", "JMIS": "修正国際基準"}
+    for element in tree.iter():
+        name = _local_name(_element_name(element))
+        value = (element.text or "").strip()
+        if name == "AccountingStandardsDEI" and value:
+            metadata["accounting_standard"] = standards.get(value, value)
+        elif name == "WhetherConsolidatedFinancialStatementsArePreparedDEI":
+            metadata["consolidation_scope"] = "連結" if value.lower() == "true" else "単体" if value.lower() == "false" else None
+    return metadata
+
+
+def _extract_equity(facts: list[Fact], contexts: dict[str, ContextInfo], *, prefer_consolidated: bool = True) -> tuple[float | None, dict | None]:
+    # Japanese GAAP shareholders' equity omits accumulated OCI. It is not the
+    # owners' capital used in ROE and the equity ratio.
+    direct_spec = MetricSpec("自己資本", "instant", (
+        "EquityAttributableToOwnersOfParentIFRSSummaryOfBusinessResults",
+        "EquityAttributableToOwnersOfParentIFRS", "EquityAttributableToOwnersOfParent",
+        "TotalEquityAttributableToOwnersOfParent", "OwnersEquity",
+    ))
+    value, detail = _extract_metric("equity", direct_spec, facts, contexts, prefer_consolidated=prefer_consolidated)
+    if value is not None:
+        return value, detail
+    component_details = []
+    for name in ("ShareholdersEquity", "ValuationAndTranslationAdjustments"):
+        component, selected = _extract_metric("equity", MetricSpec("自己資本内訳", "instant", (name,)), facts, contexts, prefer_consolidated=prefer_consolidated)
+        if component is None:
+            return None, {"method": "unavailable_incomplete_owners_equity"}
+        component_details.append(selected)
+    if component_details[0].get("context_period") != component_details[1].get("context_period"):
+        return None, {"method": "unavailable_mismatched_equity_periods"}
+    value = sum(item["value"] for item in component_details)
+    return value, {"value": value, "method": "shareholders_equity_plus_accumulated_oci", "components": component_details}
 
 
 def _candidate_files(root: Path) -> list[Path]:

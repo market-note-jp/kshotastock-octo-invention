@@ -15,11 +15,18 @@ from financial_analysis import INDICATOR_LABELS, RAW_METRIC_ORDER
 
 DEFAULT_DB_FILENAME = "edinet_financials.sqlite3"
 ROIC_TEXT_COLUMNS = [
+    "reported_eps_source_doc_id",
+    "reported_bps_source_doc_id",
+    "accounting_standard",
+    "consolidation_scope",
+    "source_updated_at",
     "roic_invested_capital_formula",
     "roic_invested_capital_note",
     "roic_unavailable_reason",
 ]
 SHARE_METRIC_COLUMNS = [
+    "reported_eps",
+    "reported_bps",
     "issued_shares",
     "treasury_shares",
     "shares_for_valuation",
@@ -106,7 +113,7 @@ def initialize_database(db_path: str | Path | None = None) -> Path:
     return path
 
 
-def save_financial_record(record: dict[str, Any], db_path: str | Path | None = None) -> None:
+def save_financial_record(record: dict[str, Any], db_path: str | Path | None = None, *, preserve_existing: bool = False) -> None:
     path = initialize_database(db_path)
     columns = [
         "edinet_code",
@@ -115,6 +122,11 @@ def save_financial_record(record: dict[str, Any], db_path: str | Path | None = N
         "doc_id",
         "doc_type_code",
         "doc_description",
+        "accounting_standard",
+        "reported_eps_source_doc_id",
+        "reported_bps_source_doc_id",
+        "consolidation_scope",
+        "source_updated_at",
         "fiscal_year",
         "period_start",
         "period_end",
@@ -141,13 +153,14 @@ def save_financial_record(record: dict[str, Any], db_path: str | Path | None = N
     values = [_serialize_value(record.get(column)) for column in columns]
     placeholders = ", ".join(["?"] * len(columns))
     updates = ", ".join([f"{column}=excluded.{column}" for column in columns if column != "doc_id"])
+    conflict_action = "DO NOTHING" if preserve_existing else f"DO UPDATE SET {updates}"
 
     with sqlite3.connect(path) as conn:
         conn.execute(
             f"""
             INSERT INTO financial_data ({", ".join(columns)})
             VALUES ({placeholders})
-            ON CONFLICT(doc_id) DO UPDATE SET {updates}
+            ON CONFLICT(doc_id) {conflict_action}
             """,
             values,
         )

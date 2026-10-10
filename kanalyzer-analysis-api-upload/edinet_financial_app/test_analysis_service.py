@@ -68,7 +68,7 @@ class AnalysisServiceTest(unittest.TestCase):
         )
 
         self.assertIn("records", payload)
-        self.assertNotIn("history", payload["dcf"])
+        self.assertNotIn("dcf", payload)
         self.assertNotIn("extraction_details_json", payload["records"][0])
         self.assertNotIn("raw_document_json", payload["records"][0])
 

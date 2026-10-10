@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import math
+import hashlib
+import json
 import os
+import tempfile
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -11,7 +14,6 @@ import pandas as pd
 from anomaly_detection import detect_anomalies
 from app_config import get_user_data_dir, load_edinet_api_key
 from database import get_saved_fiscal_month, save_financial_record
-from dcf_analysis import assumptions_from_summary, build_dcf_model, calculate_historical_dcf_metrics
 from edinet_api import EdinetApiError, EdinetClient, normalize_edinet_code
 from excel_export import format_security_code
 from financial_analysis import (
@@ -120,16 +122,48 @@ def parse_submission_months(raw_choices: object) -> set[int] | None:
     return months or None
 
 
+def _parsed_document(client: EdinetClient, doc_id: str) -> dict[str, Any]:
+    # The document ID identifies the filing; amendments have their own IDs.
+    # Invalidate extraction caches whenever parser code or requested fields change.
+    parser_version = hashlib.sha256(Path(__file__).with_name("xbrl_parser.py").read_bytes()).hexdigest()
+    cache_key = hashlib.sha256(f"{doc_id}:{parser_version}".encode()).hexdigest()
+    cache_dir = DATA_DIR / "parsed"
+    cache_path = cache_dir / f"{cache_key}.json"
+    try:
+        parsed = json.loads(cache_path.read_text(encoding="utf-8"))
+        if isinstance(parsed, dict) and parsed.get("facts_count", 0) > 0 and isinstance(parsed.get("metrics"), dict) and isinstance(parsed.get("details"), dict):
+            return parsed
+    except (OSError, ValueError, TypeError):
+        pass
+    zip_path = client.download_document_zip(doc_id, DOWNLOAD_DIR)
+    extracted_dir = client.extract_zip(zip_path, EXTRACT_DIR)
+    parsed = extract_financial_data(extracted_dir)
+    if parsed.get("facts_count", 0) > 0:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=cache_dir, delete=False) as handle:
+                temporary_path = Path(handle.name)
+                json.dump(parsed, handle, ensure_ascii=False)
+            os.replace(temporary_path, cache_path)
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+    return parsed
+
+
 def analyze_documents(client: EdinetClient, documents: list[dict[str, Any]]) -> pd.DataFrame:
     records: list[dict[str, Any]] = []
+    parsed_documents: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for document in documents:
-        zip_path = client.download_document_zip(str(document["doc_id"]), DOWNLOAD_DIR)
-        extracted_dir = client.extract_zip(zip_path, EXTRACT_DIR)
-        parsed = extract_financial_data(extracted_dir)
+        parsed = _parsed_document(client, str(document["doc_id"]))
         records.append(build_financial_record(document, parsed))
+        parsed_documents.append((document, parsed))
 
     if not records:
         return pd.DataFrame()
+
+    apply_latest_per_share_history(records, parsed_documents)
 
     analyzed_df = calculate_indicators(pd.DataFrame(records))
     for record in analyzed_df.to_dict(orient="records"):
@@ -137,10 +171,21 @@ def analyze_documents(client: EdinetClient, documents: list[dict[str, Any]]) -> 
     return analyzed_df
 
 
+def apply_latest_per_share_history(records: list[dict[str, Any]], parsed_documents: list[tuple[dict[str, Any], dict[str, Any]]]) -> None:
+    latest_document, latest_parsed = max(parsed_documents, key=lambda pair: (pair[0].get("period_end") or "", pair[0].get("submit_date_time") or ""))
+    history = latest_parsed.get("per_share_history", {})
+    for record in records:
+        for key in ("reported_eps", "reported_bps"):
+            restated = history.get(record.get("period_end"), {}).get(key)
+            if restated is not None:
+                record[key] = restated
+                record[key + "_source_doc_id"] = latest_document.get("doc_id")
+                record["extraction_details_json"][key] = history[record["period_end"]].get(key + "_detail")
+
+
 def build_financial_record(document: dict[str, Any], parsed: dict[str, Any]) -> dict[str, Any]:
     metrics = parsed.get("metrics", {})
     details = parsed.get("details", {})
-    capex_metadata = _capex_metadata(details.get("capex"))
     derived_period = _derive_period_from_details(details)
     period_start = document.get("period_start") or derived_period.get("start_date")
     period_end = document.get("period_end") or derived_period.get("end_date") or derived_period.get("instant")
@@ -158,7 +203,9 @@ def build_financial_record(document: dict[str, Any], parsed: dict[str, Any]) -> 
         "submit_date_time": document.get("submit_date_time"),
         "unit": "円",
         **metrics,
-        **capex_metadata,
+        **parsed.get("document_metadata", {}),
+        "source_updated_at": document.get("submit_date_time"),
+        "record_type": "actual",
         "extraction_details_json": details,
         "raw_document_json": document.get("raw", {}),
     }
@@ -171,16 +218,8 @@ def build_analysis_payload(df: pd.DataFrame) -> dict[str, Any]:
     data = df.sort_values([column for column in ["period_end", "fiscal_year", "submit_date_time"] if column in df.columns])
     latest = data.iloc[-1]
     anomalies = detect_anomalies(data)
-    historical_dcf_data, dcf_summary, dcf_latest = calculate_historical_dcf_metrics(data)
-    dcf_assumptions = assumptions_from_summary(dcf_summary)
-    suitability = _assess_dcf_suitability(latest)
-    dcf_model = (
-        {"error": suitability["message"], "suitability": suitability}
-        if suitability["status"] == "requires_business_separation"
-        else _default_dcf_model(dcf_assumptions, dcf_latest)
-    )
-
-    payload = {
+    return _json_safe({
+        "profile": "financial-statements",
         "records": [_record_payload(record) for record in data.to_dict(orient="records")],
         "latest": {
             "companyName": latest.get("company_name"),
@@ -190,36 +229,12 @@ def build_analysis_payload(df: pd.DataFrame) -> dict[str, Any]:
             "fiscalYear": latest.get("fiscal_year"),
         },
         "metrics": _metric_cards(latest),
-        "priceIndicators": _json_safe(calculate_price_indicators(data)),
+        "priceIndicators": calculate_price_indicators(data),
         "anomalies": anomalies,
         "comments": generate_analysis_comments(data, anomalies),
-        "dcf": {
-            "suitability": suitability,
-            "summary": _dataframe_records(dcf_summary),
-            "assumptions": dcf_assumptions,
-            "historical": _dataframe_records(_dcf_history_payload(historical_dcf_data)),
-            "latest": dcf_latest,
-            "model": dcf_model,
-        },
-    }
-    return _json_safe(payload)
-
-
-def _assess_dcf_suitability(latest: pd.Series) -> dict[str, Any]:
-    financial_receivables = {
-        key: _safe_number(latest.get(key))
-        for key in ("financial_services_receivables_current", "financial_services_receivables_noncurrent")
-    }
-    if any(value is not None and value > 0 for value in financial_receivables.values()):
-        return {
-            "status": "requires_business_separation",
-            "message": "金融事業の債権が含まれています。通常の事業会社向けDCFを全社に適用すると、事業キャッシュフローと負債の範囲が一致しない可能性があります。金融事業と非金融事業を分けて評価するまで、理論株価の表示を保留します。",
-            "evidence": financial_receivables,
-        }
-    return {
-        "status": "not_independently_reviewed",
-        "message": "DCFは過去実績の平均と仮定WACC 8%・永続成長率1%による参考試算です。企業固有の資本コスト・成長見通しや適用範囲は未審査です。金融事業が検出されなかったことは、その不存在の証明ではありません。",
-    }
+        "financialBusinessDetected": any((_safe_number(latest.get(key)) or 0) > 0 for key in (
+            "financial_services_receivables_current", "financial_services_receivables_noncurrent")),
+    })
 
 
 def _metric_cards(latest: pd.Series) -> list[dict[str, Any]]:
@@ -258,105 +273,26 @@ def _record_payload(record: dict[str, Any]) -> dict[str, Any]:
         "roic_uses_alternative_invested_capital",
         "roic_invested_capital_note",
         "roic_unavailable_reason",
+        "reported_eps",
+        "reported_bps",
+        "reported_eps_source_doc_id",
+        "reported_bps_source_doc_id",
+        "roa_period_end",
+        "roe_period_end",
+        "accounting_standard",
+        "consolidation_scope",
+        "source_updated_at",
+        "record_type",
         "issued_shares",
         "treasury_shares",
         "shares_for_valuation",
         "financial_services_receivables_current",
         "financial_services_receivables_noncurrent",
     ]
-    return {key: record.get(key) for key in dict.fromkeys(keys)}
-
-
-def _dcf_history_payload(df: pd.DataFrame) -> pd.DataFrame:
-    columns = [
-        "fiscal_year",
-        "period_end",
-        "sales_growth_rate",
-        "operating_margin",
-        "effective_tax_rate",
-        "dcf_nopat",
-        "dcf_invested_capital",
-        "dcf_previous_invested_capital",
-        "dcf_average_invested_capital",
-        "depreciation_rate",
-        "capex_outflow",
-        "capex_rate",
-        "capex_method",
-        "working_capital",
-        "working_capital_ratio",
-        "change_in_working_capital",
-        "dcf_fcf",
-        "fcf_margin",
-        "roic",
-    ]
-    existing = [column for column in columns if column in df.columns]
-    return df[existing].copy() if existing else pd.DataFrame()
-
-
-def _default_dcf_model(assumptions: dict[str, Any], latest_info: dict[str, Any]) -> dict[str, Any] | None:
-    required_inputs = {
-        "latest_revenue": "直近年度の売上高", "latest_cash": "現金及び現金同等物",
-        "latest_debt": "有利子負債", "latest_working_capital": "運転資本",
-        "shares_for_valuation": "評価用株式数",
-    }
-    assumption_labels = {
-        "sales_growth_rate": "売上成長率（複数年度が必要）", "operating_margin": "営業利益率",
-        "effective_tax_rate": "実効税率", "capex_rate": "CAPEX率",
-        "depreciation_rate": "減価償却率", "working_capital_ratio": "運転資本率",
-    }
-    missing = [label for key, label in required_inputs.items() if _safe_number(latest_info.get(key)) is None]
-    missing.extend(label for key, label in assumption_labels.items() if _safe_number(assumptions.get(key)) is None)
-    if missing:
-        return {"error": "DCFの必須データを取得できませんでした：" + "、".join(missing) + "。欠損を0で補わず、計算を保留しています。", "missing_inputs": missing}
-    if _safe_number(latest_info.get("shares_for_valuation")) <= 0:
-        return {"error": "評価用株式数は0より大きい必要があります。"}
-    try:
-        result = build_dcf_model(
-            latest_revenue=_safe_number(latest_info.get("latest_revenue")),
-            latest_cash=_safe_number(latest_info.get("latest_cash")),
-            latest_debt=_safe_number(latest_info.get("latest_debt")),
-            latest_working_capital=_safe_number(latest_info.get("latest_working_capital")),
-            forecast_years=5,
-            sales_growth_rate=_safe_assumption(assumptions.get("sales_growth_rate"), 0.0),
-            operating_margin=_safe_assumption(assumptions.get("operating_margin"), 0.0),
-            effective_tax_rate=_safe_assumption(assumptions.get("effective_tax_rate"), 0.30),
-            capex_rate=_safe_assumption(assumptions.get("capex_rate"), 0.0),
-            depreciation_rate=_safe_assumption(assumptions.get("depreciation_rate"), 0.0),
-            working_capital_ratio=_safe_assumption(assumptions.get("working_capital_ratio"), 0.0),
-            wacc=0.08,
-            perpetual_growth_rate=0.01,
-            shares_outstanding=_safe_number(latest_info.get("shares_for_valuation")) or 0.0,
-            current_share_price=0.0,
-        )
-    except ValueError as exc:
-        return {"error": str(exc)}
-
-    return {
-        "assumptions": {
-            "forecast_years": 5,
-            "wacc": 0.08,
-            "perpetual_growth_rate": 0.01,
-            "sales_growth_rate": _safe_assumption(assumptions.get("sales_growth_rate"), 0.0),
-            "operating_margin": _safe_assumption(assumptions.get("operating_margin"), 0.0),
-            "effective_tax_rate": _safe_assumption(assumptions.get("effective_tax_rate"), 0.30),
-            "capex_rate": _safe_assumption(assumptions.get("capex_rate"), 0.0),
-            "depreciation_rate": _safe_assumption(assumptions.get("depreciation_rate"), 0.0),
-            "working_capital_ratio": _safe_assumption(assumptions.get("working_capital_ratio"), 0.0),
-        },
-        "valuation": {
-            "enterprise_value": result.enterprise_value,
-            "terminal_value": result.terminal_value,
-            "terminal_value_pv": result.terminal_value_pv,
-            "forecast_fcf_pv_sum": result.forecast_fcf_pv_sum,
-            "equity_value": result.equity_value,
-            "theoretical_share_price": result.theoretical_share_price,
-            "price_difference": result.price_difference,
-            "upside_rate": result.upside_rate,
-            "sensitivity_value_label": result.sensitivity_value_label,
-        },
-        "forecast": _dataframe_records(result.forecast),
-        "sensitivity": _dataframe_records(result.sensitivity),
-    }
+    payload = {key: record.get(key) for key in dict.fromkeys(keys)}
+    payload["source_url"] = f"https://disclosure2dl.edinet-fsa.go.jp/searchdocument/pdf/{record['doc_id']}.pdf" if record.get("doc_id") else None
+    payload["per_share_basis"] = "最新取得書類に再掲された公表値を優先。再掲値がない年度は当該年度の原資料を使用。"
+    return payload
 
 
 def _company_payload(documents: list[dict[str, Any]], edinet_code: str | None, company_name: str | None) -> dict[str, Any]:
@@ -402,7 +338,7 @@ def _parse_years(value: object) -> int:
     try:
         years = int(value)
     except (TypeError, ValueError):
-        years = 5
+        years = 3
     if not 1 <= years <= 10:
         raise AnalysisServiceError("分析期間は1年から10年の間で指定してください。")
     return years
@@ -422,21 +358,6 @@ def _clean_text(value: object) -> str | None:
         return None
     text = str(value).strip()
     return text or None
-
-
-def _capex_metadata(detail: object) -> dict[str, Any]:
-    if not isinstance(detail, dict):
-        return {"capex_method": None, "capex_source_tags": None, "capex_is_estimated": None}
-    source_tags = detail.get("source_tags") or []
-    if isinstance(source_tags, str):
-        source_tags = [source_tags]
-    if not source_tags and detail.get("local_name"):
-        source_tags = [detail.get("local_name")]
-    return {
-        "capex_method": detail.get("method"),
-        "capex_source_tags": ", ".join(str(tag) for tag in source_tags if tag),
-        "capex_is_estimated": detail.get("method") == "estimated_from_assets",
-    }
 
 
 def _derive_period_from_details(details: dict[str, Any]) -> dict[str, Any]:
@@ -464,11 +385,6 @@ def _derive_fiscal_year(period_start: str | None, period_end: str | None) -> str
 def _dataframe_records(df: pd.DataFrame) -> list[dict[str, Any]]:
     records = df.to_dict(orient="records") if isinstance(df, pd.DataFrame) and not df.empty else []
     return _json_safe(records)
-
-
-def _safe_assumption(value: Any, fallback: float) -> float:
-    parsed = _safe_number(value)
-    return fallback if parsed is None else parsed
 
 
 def _safe_number(value: Any) -> float | None:
